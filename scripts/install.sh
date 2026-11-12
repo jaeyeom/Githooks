@@ -69,7 +69,7 @@ check_tool "tar"
 check_tool "unzip"
 check_tool "uname"
 
-org=gabyx
+org=jaeyeom
 repo=githooks
 
 unInstall="false"
