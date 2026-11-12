@@ -61,12 +61,8 @@ function get_platform_arch() {
 }
 
 check_bash
-check_tool "grep"
-check_tool "jq"
-check_tool "curl"
-check_tool "sha256sum"
-check_tool "tar"
-check_tool "unzip"
+check_tool "git"
+check_tool "go"
 check_tool "uname"
 
 org=jaeyeom
@@ -113,9 +109,9 @@ function version_compare() {
 function print_help() {
     echo -e "Usage: install.sh [options...] [-- <installer-args>...]\n\n" \
         "Options:\n" \
-        "  --version <version> : The version to download (if not latest)\n" \
-        "                        and install.\n" \
-        "  --uninstall         : Uninstall Githooks. Uses always the latest uninstaller.\n" \
+        "  --version <version> : Git tag or branch to clone and build.\n" \
+        "                        Default: the repository's default branch.\n" \
+        "  --uninstall         : Uninstall Githooks. Builds the uninstaller from the same checkout.\n" \
         "all other arguments are forwarded to the installer."
 }
 
@@ -192,114 +188,58 @@ trap clean_up EXIT
 
 parse_args "$@"
 
-if [ "$versionTag" = "" ] || [ "$unInstall" = "true" ]; then
-    # Find the latest version using the GitHub API
-    response="$tempDir/response"
-    http_status=$(curl --silent --output "$response" -w "%{response_code}" \
-        --location "https://api.github.com/repos/$org/$repo/releases") || {
-        echo "!! Could not get releases info from github.com"
-        exit 1
-    }
-
-    if [ "$http_status" != "200" ]; then
-        echo "Could not get latest tag. Status code: '$http_status'."
-        exit 1
-    fi
-
-    versionTag=$(
-        jq --raw-output 'map(select((.assets | length) > 0)) | .[0].tag_name' <"$response"
-    )
+# No GitHub release is required. The v2→v3 guard still needs a version
+# when --version was not given; the checkout itself stays on the default branch.
+checkoutRef="$versionTag"
+if [ -z "$versionTag" ]; then
+    versionTag="v3.0.6"
 fi
 
 check_old_version_v2 "$versionTag"
 
 os=""
-arch=""
-
 get_platform_os os
-get_platform_arch arch
 
-# The download used `macos` for `darwin` platform.
-if [ "$os" = "darwin" ]; then
-    os="macos"
-fi
-
-# Download and install
-response="$tempDir/response"
-http_status=$(curl --silent --output "$response" -w "%{response_code}" \
-    "https://api.github.com/repos/$org/$repo/releases/tags/$versionTag") || {
-    echo "Could not get releases from github.com."
-    exit 1
-}
-
-if [ "$http_status" != "200" ]; then
-    echo "Could not get release info. Status code: '$http_status'."
-    exit 1
-fi
-
-checksumFileURL=$(jq --raw-output '.assets[] | select( .name == "githooks.checksums") | .browser_download_url' <"$response")
-
-url=$(
-    jq --raw-output ".assets[] |
-        select( (.name | contains(\"$os\"))
-                    and (.name | contains(\"$arch\")) ) |
-                         .browser_download_url" <"$response"
-) || {
-    echo "Could not get assets from tag '$versionTag'."
-    exit 1
-}
-
-if [ -z "$url" ]; then
-    echo -e "!! Unsupported operating system '$os' or \n" \
-        "machine type '$arch': \n" \
-        "Please check 'https://github.com/$org/${repo}/releases' manually."
-
-    exit 1
-fi
-
-githooks="$tempDir/githooks"
-mkdir -p "$githooks"
-
-cd "$tempDir"
-
-echo -e "Downloading '$checksumFileURL'..."
-checksums=$(curl --progress-bar --location "$checksumFileURL")
-
-echo -e "Downloading '$url'..."
-curl --progress-bar --location "$url" -o githooks.install
-
-checksum=$(sha256sum "githooks.install" | cut -d ' ' -f 1)
-if ! echo "$checksums" | grep -q "$checksum"; then
-    echo "!! Checksum sha265 '$checksum' could not be verified in 'githooks.checksums' file."
-    echo "$checksums"
-
-    exit 1
+cloneURL="https://github.com/${org}/${repo}.git"
+srcDir="$tempDir/src"
+echo "Cloning '$cloneURL'..."
+if [ -n "$checkoutRef" ]; then
+    git clone --template= -c core.hooksPath=.git/hooks --branch "$checkoutRef" "$cloneURL" "$srcDir"
 else
-    echo -e "\n=============================\nChecksums verified!\n=============================\n"
+    git clone --template= -c core.hooksPath=.git/hooks "$cloneURL" "$srcDir"
 fi
 
-case "$url" in
-*.tar.gz)
-    tar -C "$githooks" -xzf "githooks.install" >/dev/null
-    ;;
-
-*.zip)
-    unzip -d "$githooks" "$githooks.install" >/dev/null
-    ;;
-esac
-
-cliExe="cli"
-if [ ! -f "githooks/cli" ]; then
-    # Version 3 has new names
-    cliExe="githooks-cli"
+commit="$(git -C "$srcDir" rev-parse HEAD)"
+if [ -n "$checkoutRef" ]; then
+    export GH_BUILD_VERSION="${checkoutRef#v}"
+else
+    export GH_BUILD_VERSION="3.0.6"
 fi
+# The installer resets its clone to this ref. Use the commit, because this
+# fork does not publish version tags.
+export GH_BUILD_TAG="$commit"
 
+cliExe="githooks-cli"
 if [ "$os" = "windows" ]; then
-    cliExe="$cliExe.exe"
+    cliExe="${cliExe}.exe"
 fi
+
+binDir="$tempDir/githooks"
+mkdir -p "$binDir"
+
+echo "Building '$cliExe' at '$commit'..."
+(
+    cd "$srcDir/githooks"
+    go mod vendor
+    go generate -mod=vendor ./...
+    CGO_ENABLED=0 go build -mod=vendor -o "$binDir/$cliExe" ./apps/cli
+)
 
 if [ "$unInstall" = "true" ]; then
-    "githooks/$cliExe" uninstaller "${installerArgs[@]}"
+    "$binDir/$cliExe" uninstaller "${installerArgs[@]}"
 else
-    "githooks/$cliExe" installer "${installerArgs[@]}"
+    "$binDir/$cliExe" installer \
+        --build-from-source \
+        --clone-url "$cloneURL" \
+        "${installerArgs[@]}"
 fi
